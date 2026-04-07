@@ -282,7 +282,7 @@ DiagnosticsEnabled = $diagnosticsEnabled
 SendingToLogAnalytics = $sendingToLogAnalytics
 }
 }
-$csvPath = "/home/johnathan/diagnostics-status-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+$csvPath = Join-Path $PWD.Path "diagnostics-status-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
 $refreshedResults | Export-Csv -Path $csvPath -NoTypeInformation
 # ============================================================
 # STEP 7: Print summary
