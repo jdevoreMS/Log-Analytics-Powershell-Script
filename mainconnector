@@ -1,637 +1,307 @@
-# ===================================================================================== # why: visual separator so the script is easy to scan
-# SOC2 LOGGING ONBOARDING SCRIPT (MODERN)                                                # why: describes the script’s purpose at top
-# - Platform resource logs via Diagnostic Settings                                        # why: resource logs are collected via diagnostic settings today [1](https://www.security-docs.com/blog/soc2-logging-monitoring)[2](https://truvo.ca/blog/security-logging-and-monitoring-architecture-guide)
-# - Platform metrics via DCR Metrics Export (opt-in for duplicate cost)                   # why: DCR metrics export is the modern approach and avoids diag-metrics duplication [3](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-create)[4](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-structure)
-# - VM guest logs via AMA + DCR (Windows Event Logs + Linux Syslog)                       # why: AMA+DCR is used to collect guest logs; Windows to Event, Linux to Syslog [5](https://learn.microsoft.com/en-us/azure/azure-monitor/vm/data-collection-windows-events)[7](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/data-collection-rule-overview)[8](https://docs.azure.cn/en-us/azure-monitor/data-collection/data-collection-rule-samples)
-# ------------------------------------------------------------------------------------- # why: keeps header block readable
-# REQUIRED PERMISSIONS (RBAC)                                                            # why: user asked for a note up top about RBAC
-# - Read subscription resources: Reader (or equivalent)                                  # why: script enumerates RGs/resources and checks settings
-# - Create/Update diagnostic settings on resources: Microsoft.Insights/diagnosticSettings/write # why: needed to create diagnostic settings for logs/metrics
-# - Create/Update Log Analytics workspace (if creating): Contributor on the RG            # why: workspace is an ARM resource created in RG
-# - Create/Update DCRs and associate them: Monitoring Contributor (or equivalent)         # why: DCR create/associate typically covered by Monitoring Contributor [11](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/data-collection-rule-create-edit)[10](https://learn.microsoft.com/en-us/powershell/module/az.monitor/new-azdatacollectionruleassociation?view=azps-15.4.0)
-# - Install VM extensions (AMA): Contributor on VM (or equivalent)                        # why: AMA is deployed via VM extension
-# ------------------------------------------------------------------------------------- # why: keeps top note structured
-# EXPECTED TIMELINES                                                                      # why: user asked to set expectations before running
-# - Platform metrics (DCR export): ~3 minutes, allow up to 15 minutes initially           # why: documented latency guidance [3](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-create)
-# - Platform logs (diagnostic settings): varies by source                                 # why: Azure notes ingestion latency varies for diagnostic settings sources [2](https://truvo.ca/blog/security-logging-and-monitoring-architecture-guide)
-# - VM guest logs: depends on AMA extension install + DCR association                      # why: agent install and rule association must complete before data flows [10](https://learn.microsoft.com/en-us/powershell/module/az.monitor/new-azdatacollectionruleassociation?view=azps-15.4.0)[5](https://learn.microsoft.com/en-us/azure/azure-monitor/vm/data-collection-windows-events)[7](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/data-collection-rule-overview)
-# ===================================================================================== # why: end of header block
-
-Set-StrictMode -Version Latest                                                        # why: catch common scripting mistakes early for reliability
-$ErrorActionPreference = "Stop"                                                        # why: fail fast on unexpected errors (we use try/catch where needed)
-$ProgressPreference = "SilentlyContinue"                                               # why: reduce noisy progress UI when scanning many resources
-
-# -------------------------------                                                        # why: visual separator for the next section
-# STEP 0: Helpers (sanitization + safe prompts)                                          # why: keeps the main flow readable
-
-function Get-RgToken {                                                                 # why: consistent, reusable sanitizer for RG token
-    param([string]$RgName)                                                             # why: accept a raw RG name from Azure
-    $token = $RgName.ToLowerInvariant()                                                # why: normalize case so names are consistent
-    $token = ($token -replace '[^a-z0-9-]', '-')                                       # why: replace invalid name chars with dash to avoid deployment failures
-    $token = ($token -replace '-{2,}', '-')                                            # why: collapse repeated dashes for readability
-    $token = $token.Trim('-')                                                          # why: remove leading/trailing dashes to keep names clean
-    if ([string]::IsNullOrWhiteSpace($token)) { $token = "rg" }                         # why: guarantee a non-empty token even for odd RG names
-    return $token                                                                      # why: return the safe token for naming created resources
-}                                                                                      # why: end helper function
-
-function Read-Choice {                                                                 # why: consistent prompting with default
-    param(                                                                             # why: define inputs
-        [string]$Prompt,                                                              # why: message shown to user
-        [string[]]$Valid,                                                             # why: allowed answers
-        [string]$Default                                                              # why: default answer if user presses Enter
-    )                                                                                 # why: end param block
-    while ($true) {                                                                    # why: loop until a valid answer comes back
-        $raw = Read-Host "$Prompt (default: $Default)"                                 # why: ask user for input but show default
-        if ([string]::IsNullOrWhiteSpace($raw)) { $raw = $Default }                    # why: apply default when user hits Enter
-        if ($Valid -contains $raw) { return $raw }                                     # why: return only valid answers
-        Write-Host "Invalid choice. Valid: $($Valid -join ', ')" -ForegroundColor Yellow # why: guide the user without failing abruptly
-    }                                                                                  # why: end loop
-}                                                                                      # why: end helper function
-
-# -------------------------------                                                        # why: visual separator for module check
-# STEP 0B: Ensure needed Az cmdlets exist                                                # why: DCR creation/association cmdlets are Az.Monitor [9](https://learn.microsoft.com/en-us/powershell/module/az.monitor/new-azdatacollectionrule?view=azps-15.4.0)[10](https://learn.microsoft.com/en-us/powershell/module/az.monitor/new-azdatacollectionruleassociation?view=azps-15.4.0)
-
-if (-not (Get-Command New-AzDataCollectionRule -ErrorAction SilentlyContinue)) {       # why: verify DCR cmdlet exists before proceeding [9](https://learn.microsoft.com/en-us/powershell/module/az.monitor/new-azdatacollectionrule?view=azps-15.4.0)
-    throw "Missing cmdlet New-AzDataCollectionRule. Ensure Az.Monitor is installed/loaded." # why: stop early with actionable error
-}                                                                                      # why: end check
-
-if (-not (Get-Command New-AzDataCollectionRuleAssociation -ErrorAction SilentlyContinue)) { # why: verify DCR association cmdlet exists [10](https://learn.microsoft.com/en-us/powershell/module/az.monitor/new-azdatacollectionruleassociation?view=azps-15.4.0)
-    throw "Missing cmdlet New-AzDataCollectionRuleAssociation. Ensure Az.Monitor is installed/loaded." # why: stop early with actionable error
-}                                                                                      # why: end check
-
-# -------------------------------                                                        # why: visual separator for context
-# STEP 1: Pick the Resource Group to work with                                           # why: user asked to list RGs and pick by number
-
-$context = Get-AzContext                                                                # why: confirm we’re authenticated and have a subscription context
-if (-not $context) { throw "No AzContext found. Run Connect-AzAccount first." }         # why: fail with clear guidance if not logged in
-
-$subscriptionId = $context.Subscription.Id                                              # why: store subscription id for logging/reporting
-Write-Host "Using subscription: $($context.Subscription.Name) ($subscriptionId)" -ForegroundColor Cyan # why: show user which subscription is targeted
-
-$resourceGroups = Get-AzResourceGroup | Sort-Object ResourceGroupName                   # why: list available RGs for user selection
-if (-not $resourceGroups -or $resourceGroups.Count -eq 0) { throw "No resource groups found in this subscription." } # why: guard against empty subscriptions
-
-Write-Host "Available Resource Groups:" -ForegroundColor Cyan                           # why: prompt user to choose a target RG
-for ($i = 0; $i -lt $resourceGroups.Count; $i++) {                                      # why: number the RG list for easy selection
-    Write-Host ("  [{0}] {1} ({2})" -f ($i+1), $resourceGroups[$i].ResourceGroupName, $resourceGroups[$i].Location) -ForegroundColor Gray # why: show RG + region
-}                                                                                       # why: end RG list loop
-
-$rgIndexRaw = Read-Host "Enter the number of the resource group you want to work with"  # why: let user choose RG by index
-if ($rgIndexRaw -notmatch '^\d+$') { throw "Selection must be a number. Re-run and choose a valid RG index." } # why: validate numeric input
-$rgIndex = [int]$rgIndexRaw                                                             # why: convert to integer for indexing
-if ($rgIndex -lt 1 -or $rgIndex -gt $resourceGroups.Count) { throw "Selection out of range. Re-run and choose a valid RG index." } # why: validate bounds
-
-$rgName = $resourceGroups[$rgIndex-1].ResourceGroupName                                 # why: chosen RG display name
-$rgLocation = $resourceGroups[$rgIndex-1].Location                                      # why: chosen RG location (region)
-$rgToken = Get-RgToken -RgName $rgName                                                   # why: sanitized token for naming resources (user approved sanitization)
-$dateToken = (Get-Date -Format "MMddyyyy")                                               # why: MMDDYYYY suffix per your standard
-Write-Host "Selected RG: $rgName | Location: $rgLocation | Token: $rgToken | Date: $dateToken" -ForegroundColor Green # why: confirm selection + derived naming
-
-# -------------------------------                                                        # why: visual separator for workspace detection
-# STEP 2: Detect “monitoring tooling” and recommend a workspace                          # why: user wanted awareness of Sentinel/Insights/Policy/Defender and workspace reuse
-
-$allWorkspaces = Get-AzOperationalInsightsWorkspace                                      # why: enumerate workspaces to allow “use existing” selection
-$workspacesInRg = @()                                                                    # why: list workspaces in selected RG first (UX requirement)
-$workspacesOutRg = @()                                                                   # why: list workspaces outside selected RG second (UX requirement)
-
-foreach ($ws in $allWorkspaces) {                                                       # why: split into in-RG vs out-of-RG
-    if ($ws.ResourceGroupName -eq $rgName) { $workspacesInRg += $ws }                    # why: capture those in the chosen RG first
-    else { $workspacesOutRg += $ws }                                                     # why: capture those outside chosen RG for transparency
-}                                                                                       # why: end workspace split loop
-
-# --- Detect Sentinel / VMInsights solutions via OMS “solutions” resources              # why: quick heuristic to find workspaces tied to common monitoring tools
-$solutions = Get-AzResource -ResourceType "Microsoft.OperationsManagement/solutions" -ErrorAction SilentlyContinue # why: solutions often indicate Sentinel/VMInsights workspace usage
-$sentinelWorkspaceIds = @()                                                              # why: collect workspace ids linked to Sentinel
-$vminsightsWorkspaceIds = @()                                                            # why: collect workspace ids linked to VMInsights
-
-foreach ($sol in ($solutions | Where-Object { $_.Properties -ne $null })) {              # why: only process solutions that have properties payload
-    $solutionType = $sol.Properties.solutionType                                         # why: solutionType identifies the solution installed
-    $wsId = $sol.Properties.workspaceResourceId                                          # why: workspaceResourceId links solution to a workspace
-    if ($solutionType -eq "SecurityInsights" -and $wsId) { $sentinelWorkspaceIds += $wsId } # why: Sentinel solution type is SecurityInsights (workspace-level)
-    if ($solutionType -eq "VMInsights" -and $wsId) { $vminsightsWorkspaceIds += $wsId }  # why: VMInsights solution type is VMInsights (workspace-level)
-}                                                                                       # why: end solutions loop
-
-$sentinelWorkspaceIds = $sentinelWorkspaceIds | Select-Object -Unique                    # why: dedupe ids for clean messaging
-$vminsightsWorkspaceIds = $vminsightsWorkspaceIds | Select-Object -Unique                # why: dedupe ids for clean messaging
-
-$policyAssignments = Get-AzPolicyAssignment -ErrorAction SilentlyContinue                # why: detect whether Azure Policy is actively used in the subscription (high-level)
-$policyPresent = ($policyAssignments -and $policyAssignments.Count -gt 0)                # why: boolean used to inform the user
-
-$toolingDetected = @()                                                                   # why: store human-readable detected tooling hints
-if ($sentinelWorkspaceIds.Count -gt 0) { $toolingDetected += "Sentinel (SecurityInsights)" } # why: report Sentinel detection
-if ($vminsightsWorkspaceIds.Count -gt 0) { $toolingDetected += "VM Insights (VMInsights)" }   # why: report VM Insights detection
-if ($policyPresent) { $toolingDetected += "Azure Policy (assignments present)" }         # why: report policy usage (not workspace-specific)
-
-if ($toolingDetected.Count -gt 0) {                                                     # why: only show detection banner if we found something
-    Write-Host ("Detected monitoring/security signals: {0}" -f ($toolingDetected -join ", ")) -ForegroundColor Cyan # why: inform user early
-} else {                                                                                # why: provide explicit confirmation of “no signals found”
-    Write-Host "No Sentinel/VMInsights solution linkage detected (Policy may still exist). Continuing..." -ForegroundColor DarkCyan # why: avoid surprise later
-}                                                                                       # why: end detection message
-
-# --- Choose default “recommended workspace” (prefer Sentinel, else VMInsights)         # why: align with your plan: offer to use the workspace used by tooling
-$recommendedWorkspaceId = $null                                                          # why: store one recommended workspace id if available
-if ($sentinelWorkspaceIds.Count -gt 0) { $recommendedWorkspaceId = $sentinelWorkspaceIds[0] } # why: Sentinel is the strongest “security monitoring” signal
-elseif ($vminsightsWorkspaceIds.Count -gt 0) { $recommendedWorkspaceId = $vminsightsWorkspaceIds[0] } # why: fall back to VM Insights linkage if no Sentinel
-
-$recommendedWorkspace = $null                                                            # why: hold resolved workspace object for convenience
-if ($recommendedWorkspaceId) {                                                           # why: resolve workspace object only if we have an id
-    $recommendedWorkspace = $allWorkspaces | Where-Object { $_.ResourceId -eq $recommendedWorkspaceId } | Select-Object -First 1 # why: find matching workspace by resourceId
-}                                                                                       # why: end resolve block
-
-# -------------------------------                                                        # why: visual separator for workspace selection UX
-# STEP 2B: Ask: use tooling-linked workspace or use different workspace for SOC2        # why: implements your STEP 2 option text requirement
-
-$workspaceChoice = $null                                                                 # why: store user’s high-level choice
-if ($recommendedWorkspace) {                                                             # why: only offer tooling-linked “quick pick” if we found one
-    Write-Host "A workspace linked to existing tooling was found:" -ForegroundColor Cyan # why: explain why we’re recommending it
-    Write-Host ("  {0} (RG: {1}, Location: {2})" -f $recommendedWorkspace.Name, $recommendedWorkspace.ResourceGroupName, $recommendedWorkspace.Location) -ForegroundColor Gray # why: show details
-    $workspaceChoice = Read-Choice -Prompt "Choose: [1] Use this workspace for SOC2 monitoring, [2] Use a different workspace for SOC2 monitoring" -Valid @("1","2") -Default "1" # why: default to existing to reduce friction
-} else {                                                                                 # why: if no recommendation exists, default to “different”
-    Write-Host "No tooling-linked workspace identified; you can use an existing workspace or create a new one." -ForegroundColor Cyan # why: set expectation
-    $workspaceChoice = "2"                                                               # why: proceed to general selection workflow
-}                                                                                       # why: end workspace-choice logic
-
-# -------------------------------                                                        # why: visual separator for workspace list/create
-# STEP 2C: Choose existing workspace or create LogAW-soc2-<rg>-MMDDYYYY                  # why: implements Option A naming (no custom names)
-
-$workspace = $null                                                                       # why: will hold the selected/created workspace object
-
-if ($workspaceChoice -eq "1") {                                                         # why: user chose the tooling-linked workspace
-    $workspace = $recommendedWorkspace                                                   # why: assign recommended workspace as SOC2 workspace
-} else {                                                                                 # why: user chose a different workspace for SOC2
-    Write-Host "Workspaces in the selected RG (shown first):" -ForegroundColor Cyan      # why: UX requirement to list current RG first
-    if ($workspacesInRg.Count -eq 0) { Write-Host "  (none in this RG)" -ForegroundColor DarkGray } # why: make empty list explicit
-    for ($i = 0; $i -lt $workspacesInRg.Count; $i++) {                                   # why: number the in-RG workspaces
-        Write-Host ("  [RG {0}] {1}" -f ($i+1), $workspacesInRg[$i].Name) -ForegroundColor Gray # why: show inside-RG workspaces first
-    }                                                                                   # why: end in-RG listing
-
-    Write-Host "Workspaces outside the selected RG:" -ForegroundColor Cyan               # why: UX requirement to show out-of-RG and clarify
-    if ($workspacesOutRg.Count -eq 0) { Write-Host "  (none outside this RG)" -ForegroundColor DarkGray } # why: make empty list explicit
-    for ($j = 0; $j -lt $workspacesOutRg.Count; $j++) {                                   # why: number the out-of-RG workspaces
-        Write-Host ("  [OUT {0}] {1} (RG: {2})" -f ($j+1), $workspacesOutRg[$j].Name, $workspacesOutRg[$j].ResourceGroupName) -ForegroundColor DarkGray # why: highlight “outside RG”
-    }                                                                                   # why: end out-of-RG listing
-
-    $useExistingOrCreate = Read-Choice -Prompt "Choose: [1] Use an existing workspace, [2] Create a new SOC2 workspace" -Valid @("1","2") -Default "2" # why: present clear choice
-    if ($useExistingOrCreate -eq "1") {                                                  # why: user wants existing
-        $existingWsName = Read-Host "Enter the EXACT name of the workspace to use"       # why: simplest UX without fragile index mapping across two lists
-        $workspace = $allWorkspaces | Where-Object { $_.Name -eq $existingWsName } | Select-Object -First 1 # why: resolve workspace by name
-        if (-not $workspace) { throw "Workspace not found by name: $existingWsName" }   # why: fail clearly if name mismatch
-    } else {                                                                             # why: user wants to create a new SOC2 workspace
-        $workspaceName = "LogAW-soc2-$rgToken-$dateToken"                                # why: enforce Option A naming with LogAW prefix and -soc2- segment
-        Write-Host "Creating Log Analytics Workspace: $workspaceName" -ForegroundColor Cyan # why: show what will be created
-        $workspace = New-AzOperationalInsightsWorkspace -ResourceGroupName $rgName -Name $workspaceName -Location $rgLocation -Sku PerGB2018 # why: create workspace in chosen RG/region
-    }                                                                                   # why: end create vs existing
-}                                                                                       # why: end workspace selection
-
-$workspaceId = $workspace.ResourceId                                                     # why: resourceId is required for diagnostic settings and DCR destinations
-$workspaceLocation = $workspace.Location                                                 # why: DCRs must be created in same region as workspace for metrics export [3](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-create)[11](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/data-collection-rule-create-edit)
-Write-Host ("SOC2 Workspace: {0} | RG: {1} | Location: {2}" -f $workspace.Name, $workspace.ResourceGroupName, $workspaceLocation) -ForegroundColor Green # why: confirm final selection
-
-# -------------------------------                                                        # why: visual separator for scanning resources
-# STEP 3: Scan resources (subscription-wide inventory + focus on chosen RG)             # why: you wanted initial scan; changes apply per selected RG
-
-$allResources = Get-AzResource                                                           # why: subscription-wide scan for reporting and awareness
-$rgResources = $allResources | Where-Object { $_.ResourceGroupName -eq $rgName }         # why: only apply SOC2 settings to resources in the chosen RG
-
-Write-Host ("Total resources in subscription: {0}" -f $allResources.Count) -ForegroundColor Cyan # why: show scale of scan
-Write-Host ("Resources in selected RG '{0}': {1}" -f $rgName, $rgResources.Count) -ForegroundColor Cyan # why: show scope of changes
-
-$diagSettingName = "diag-logs-soc2-$rgToken-$dateToken"                                   # why: enforce naming convention for diagnostic setting name
-
-$scanResults = @()                                                                       # why: collect scan rows for CSV output
-foreach ($res in $rgResources) {                                                         # why: evaluate each resource in selected RG
-    $supported = $false                                                                  # why: will flip true if diagnostic categories exist
-    $existingDiag = @()                                                                  # why: store existing diagnostic setting objects if any
-    $existingDestinations = @()                                                          # why: store human-readable destination summary strings
-    $existingDiagNames = @()                                                             # why: store existing diagnostic setting names
-
-    try {                                                                                # why: category discovery is the safest support test for diag settings
-        $cats = Get-AzDiagnosticSettingCategory -ResourceId $res.ResourceId               # why: if this succeeds and returns categories, resource supports diag settings
-        if ($cats -and $cats.Count -gt 0) { $supported = $true }                         # why: ensure at least one category exists
-    } catch {                                                                            # why: resources without support often throw exceptions here
-        $supported = $false                                                               # why: keep false when not supported
-        $cats = @()                                                                       # why: avoid null usage later
-    }                                                                                    # why: end support test
-
-    if ($supported) {                                                                    # why: only query settings if support exists
-        try {                                                                            # why: existing settings must be detected for “keep vs add” prompts
-            $existingDiag = Get-AzDiagnosticSetting -ResourceId $res.ResourceId           # why: fetch diagnostic settings currently applied
-        } catch {                                                                        # why: treat failures as “no settings”
-            $existingDiag = @()                                                           # why: avoid null branching later
-        }                                                                                # why: end existing diag fetch
-    }                                                                                    # why: end “supported” guard
-
-    foreach ($ds in $existingDiag) {                                                     # why: summarize any existing routes for the user’s decision
-        $existingDiagNames += $ds.Name                                                   # why: collect diag setting names
-        if ($ds.WorkspaceId) { $existingDestinations += ("Workspace:{0}" -f $ds.WorkspaceId) } # why: show workspace route if present
-        if ($ds.StorageAccountId) { $existingDestinations += ("Storage:{0}" -f $ds.StorageAccountId) } # why: show storage route if present
-        if ($ds.EventHubAuthorizationRuleId) { $existingDestinations += ("EventHubAuth:{0}" -f $ds.EventHubAuthorizationRuleId) } # why: show event hub route if present
-    }                                                                                    # why: end destination summary loop
-
-    $scanResults += [PSCustomObject]@{                                                   # why: build a clean row per resource for reporting
-        ResourceName             = $res.Name                                             # why: identifyly
-        ResourceType             = $res.ResourceType                                     # why: group analysis by type
-        ResourceId               = $res.ResourceId                                       # why: needed for follow-up calls and traceability
-        AzureMonitorSupported    = $supported                                            # why: indicates whether we can apply diagnostic settings
-        ExistingDiagSettingNames = ($existingDiagNames -join ";")                        # why: show existing settings to support decision prompts
-        ExistingDestinations     = ($existingDestinations -join ";")                     # why: show current routing destinations
-    }                                                                                    # why: end row build
-}                                                                                        # why: end scan loop
-
-Write-Host "Scan complete for selected RG." -ForegroundColor Green                        # why: confirm scan end
-
-# -------------------------------                                                        # why: visual separator for diag settings application
-# STEP 4: Apply platform LOGS diagnostic settings (per resource)                         # why: platform resource logs are still collected via diagnostic settings [1](https://www.security-docs.com/blog/soc2-logging-monitoring)[2](https://truvo.ca/blog/security-logging-and-monitoring-architecture-guide)
-
-$alreadyConfigured = $scanResults | Where-Object { $_.AzureMonitorSupported -eq $true -and $_.ExistingDiagSettingNames } # why: find resources already routing somewhere
-$notConfigured = $scanResults | Where-Object { $_.AzureMonitorSupported -eq $true -and -not $_.ExistingDiagSettingNames } # why: find resources with no diag settings yet
-
-Write-Host ("Resources with existing diagnostic settings: {0}" -f $alreadyConfigured.Count) -ForegroundColor Cyan # why: show how many need a “keep vs add” decision
-Write-Host ("Resources with NO diagnostic settings (eligible for new SOC2 setting): {0}" -f $notConfigured.Count) -ForegroundColor Cyan # why: show eligible count
-
-$applyToExistingMode = "keep"                                                            # why: default to keep existing (per your decision)
-if ($alreadyConfigured.Count -gt 0) {                                                    # why: only ask if there are any existing diag settings
-    Write-Host "Existing routing detected (showing current destinations):" -ForegroundColor Cyan # why: provide transparency before asking
-    foreach ($r in $alreadyConfigured) {                                                  # why: show the user what’s already configured
-        Write-Host ("  - {0} | {1}" -f $r.ResourceName, $r.ExistingDestinations) -ForegroundColor Gray # why: compact routing summary
-    }                                                                                    # why: end display loop
-
-    $applyToExistingMode = Read-Choice -Prompt "For resources already routing logs, choose: [keep] keep existing only, [add] add SOC2 routing too (no overwrite), [switch] switch to SOC2 (not recommended)" -Valid @("keep","add","switch") -Default "keep" # why: implement your “ask the user” requirement
-}                                                                                        # why: end existing prompt decision
-
-# --- Function to create a SOC2 diagnostic setting on a resource                         # why: keeps main loop readable
-function Ensure-Soc2DiagSetting {                                                        # why: encapsulate “create diag setting” logic
-    param(                                                                               # why: define explicit inputs
-        [string]$TargetResourceId,                                                       # why: resource to configure
-        [string]$TargetResourceName,                                                     # why: for logging
-        [string]$TargetResourceType                                                      # why: for exclusions/logic
-    )                                                                                    # why: end param block
-    try {                                                                                # why: diagnostic categories vary by resource
-        $categories = Get-AzDiagnosticSettingCategory -ResourceId $TargetResourceId       # why: discover available log/metric categories for this resource
-    } catch {                                                                            # why: if categories aren’t readable, we can’t configure
-        Write-Host ("  [SKIP] Categories not readable: {0}" -f $TargetResourceName) -ForegroundColor Yellow # why: explain skip without crashing
-        return                                                                           # why: exit function early
-    }                                                                                    # why: end category fetch
-
-    $logCats = $categories | Where-Object { $_.CategoryType -eq "Logs" }                  # why: build enabled settings for log categories
-    $metricCats = $categories | Where-Object { $_.CategoryType -eq "Metrics" }            # why: build enabled settings for metric categories (platform logs step can include metrics, but we later prefer DCR metrics export)
-    $logSettings = @()                                                                   # why: collect log settings objects
-    foreach ($c in $logCats) {                                                           # why: enable all log categories to avoid missing SOC2-relevant sources
-        $logSettings += New-AzDiagnosticSettingLogSettingsObject -Category $c.Name -Enabled $true -RetentionPolicyDay 0 -RetentionPolicyEnabled $false # why: enable log category with no retention at diag-setting layer
-    }                                                                                    # why: end log categories loop
-
-    $metricSettings = @()                                                                # why: collect metric settings objects
-    foreach ($c in $metricCats) {                                                        # why: enable all metric categories *only for this setting object construction* (may be omitted later when using DCR metrics export)
-        $metricSettings += New-AzDiagnosticSettingMetricSettingsObject -Category $c.Name -Enabled $true -RetentionPolicyDay 0 -RetentionPolicyEnabled $false # why: enable metric category with no retention at diag-setting layer
-    }                                                                                    # why: end metric categories loop
-
-    $params = @{                                                                         # why: use splatting for readable cmd invocation
-        Name        = $diagSettingName                                                   # why: enforce standard naming convention
-        ResourceId  = $TargetResourceId                                                  # why: target resource id for the diagnostic setting
-        WorkspaceId = $workspaceId                                                       # why: SOC2 workspace destination
-    }                                                                                    # why: end params
-    if ($logSettings.Count -gt 0) { $params["Log"] = $logSettings }                      # why: only include Log parameter if logs exist
-    if ($metricSettings.Count -gt 0) { $params["Metric"] = $metricSettings }             # why: only include Metric parameter if metrics exist
-
-    try {                                                                                # why: attempt creation/update of diagnostic setting
-        New-AzDiagnosticSetting @params | Out-Null                                       # why: create SOC2 diagnostic setting for this resource
-        Write-Host ("  [OK] Created/Updated diag setting on: {0}" -f $TargetResourceName) -ForegroundColor Green # why: success indicator
-    } catch {                                                                            # why: handle common failures (RBAC/policy/limits)
-        Write-Host ("  [FAILED] {0}: {1}" -f $TargetResourceName, $_.Exception.Message) -ForegroundColor Red # why: show reason but continue
-    }                                                                                    # why: end try/catch
-}                                                                                        # why: end function
-
-# --- Apply to resources with no existing diag settings (safe default)                   # why: no risk of overwriting
-foreach ($r in $notConfigured) {                                                         # why: apply SOC2 diag setting to those missing it
-    $resObj = $rgResources | Where-Object { $_.ResourceId -eq $r.ResourceId } | Select-Object -First 1 # why: recover resource object for name/type
-    if (-not $resObj) { continue }                                                       # why: safety guard if resource object can’t be found
-    Write-Host ("Processing (no existing diag): {0}" -f $resObj.Name) -ForegroundColor Yellow # why: show progress to user
-    Ensure-Soc2DiagSetting -TargetResourceId $resObj.ResourceId -TargetResourceName $resObj.Name -TargetResourceType $resObj.ResourceType # why: create SOC2 diagnostic setting
-}                                                                                        # why: end no-existing loop
-
-# --- Apply to resources with existing diag settings based on user choice                # why: honors “keep vs add vs switch” policy
-foreach ($r in $alreadyConfigured) {                                                     # why: handle existing routing per decision
-    $resObj = $rgResources | Where-Object { $_.ResourceId -eq $r.ResourceId } | Select-Object -First 1 # why: recover resource object
-    if (-not $resObj) { continue }                                                       # why: safety guard
-    if ($applyToExistingMode -eq "keep") {                                               # why: default is keep existing routing only
-        Write-Host ("Skipping (keep existing): {0}" -f $resObj.Name) -ForegroundColor DarkGray # why: be explicit that we skipped by design
-        continue                                                                         # why: do not change this resource
-    }                                                                                    # why: end keep branch
-    if ($applyToExistingMode -eq "add") {                                                # why: add SOC2 routing in addition to existing
-        Write-Host ("Adding SOC2 routing (no overwrite): {0}" -f $resObj.Name) -ForegroundColor Yellow # why: show intended action
-        Ensure-Soc2DiagSetting -TargetResourceId $resObj.ResourceId -TargetResourceName $resObj.Name -TargetResourceType $resObj.ResourceType # why: create additional SOC2 setting
-        continue                                                                         # why: avoid falling into switch branch
-    }                                                                                    # why: end add branch
-    if ($applyToExistingMode -eq "switch") {                                             # why: “switch” is not recommended but available by request
-        Write-Host ("Switch requested: {0}" -f $resObj.Name) -ForegroundColor Yellow     # why: show risk action
-        Write-Host "  NOTE: Switch mode is intentionally not implemented automatically to avoid destructive changes." -ForegroundColor Yellow # why: safety guardrail
-        Write-Host "  Action: manually remove/modify existing diag settings, then re-run with 'add'." -ForegroundColor Yellow # why: provide safer alternative
-        continue                                                                         # why: do not take destructive action
-    }                                                                                    # why: end switch branch
-}                                                                                        # why: end existing loop
-
-# -------------------------------                                                        # why: visual separator for metrics export DCR
-# STEP 5: Platform METRICS export via DCR (per RG, date-stamped)                         # why: you chose DCR-based metrics export as modern approach [3](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-create)[4](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-structure)
-
-$metricsDcrName = "dcr-metrics-soc2-$rgToken-$dateToken"                                  # why: enforce naming convention for metrics DCR
-$metricsDcrId = $null                                                                    # why: store existing/created DCR resource id
-$wantDuplicateMetrics = "no"                                                             # why: default opt-in prompt result (default = No per your requirement)
-
-# --- Determine whether metrics export is already present in this RG (best-effort)      # why: avoid duplicates by default [3](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-create)
-$existingMetricsDcr = Get-AzDataCollectionRule -ResourceGroupName $rgName -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "dcr-metrics-*" } | Select-Object -First 1 # why: heuristic: look for metrics DCRs already in the RG
-if ($existingMetricsDcr) {                                                               # why: only prompt if something exists that *might* already be exporting metrics
-    Write-Host ("Existing DCR found in RG that may export metrics: {0}" -f $existingMetricsDcr.Name) -ForegroundColor Cyan # why: transparency
-    $wantDuplicateMetrics = Read-Choice -Prompt "Export metrics to SOC2 workspace too (duplicate cost)?" -Valid @("yes","no") -Default "no" # why: explicit opt-in with default No per your decision
-} else {                                                                                 # why: if none found, we can export metrics to SOC2 without “duplicate existing” warning
-    $wantDuplicateMetrics = "yes"                                                        # why: no prior detection; exporting metrics is part of baseline and not duplicative (best-effort)
-}                                                                                       # why: end metrics opt-in logic
-
-# --- Create or reuse the per-RG metrics DCR only if user opted in / needed             # why: user asked to include metrics but avoid duplicates by default
-if ($wantDuplicateMetrics -eq "yes") {                                                   # why: proceed only when user allows metrics export to SOC2 workspace
-    $existingNamed = Get-AzDataCollectionRule -ResourceGroupName $rgName -Name $metricsDcrName -ErrorAction SilentlyContinue # why: idempotency for same day re-runs
-    if ($existingNamed) {                                                                # why: reuse existing DCR if it already exists
-        $metricsDcrId = $existingNamed.Id                                                # why: save id for associations
-        Write-Host ("Reusing existing metrics DCR: {0}" -f $metricsDcrName) -ForegroundColor Green # why: confirm reuse
-    } else {                                                                             # why: create a new metrics export DCR for SOC2
-        $distinctTypes = ($rgResources | Select-Object -ExpandProperty ResourceType | Sort-Object -Unique) # why: build stream list per resource type to avoid “leaving anything out”
-        $metricStreams = @()                                                             # why: collect platform telemetry stream strings
-        foreach ($t in $distinctTypes) { $metricStreams += ("{0}:Metrics-Group-All" -f $t) } # why: collect all metrics for each resource type using Metrics-Group-All [4](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-structure)
-
-        $metricsDcrDef = @{                                                              # why: build JSON definition because metrics export uses PlatformTelemetry kind [4](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-structure)
-            location = $workspaceLocation                                                 # why: DCR must be in same region as workspace for metrics export [3](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-create)[4](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-structure)
-            kind     = "PlatformTelemetry"                                                # why: metrics export DCR kind is PlatformTelemetry [4](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-structure)
-            properties = @{                                                              # why: DCR properties container
-                dataSources = @{                                                         # why: define the source of data to collect
-                    platformTelemetry = @(
-                        @{
-                            name    = "soc2PlatformMetricsSource"                         # why: friendly name for the platform telemetry data source [4](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-structure)
-                            streams = $metricStreams                                      # why: list resource-type streams for metrics to collect [4](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-structure)
-                        }
-                    )
-                }
-                destinations = @{                                                        # why: define where metrics go (single destination per DCR) [3](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-create)[4](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-structure)
-                    logAnalytics = @(
-                        @{
-                            workspaceResourceId = $workspaceId                             # why: send metrics to SOC2 Log Analytics workspace [3](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-create)
-                            name               = "soc2LogAnalyticsDest"                    # why: destination name referenced by dataFlows [4](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-structure)
-                        }
-                    )
-                }
-                dataFlows = @(
-                    @{
-                        streams      = $metricStreams                                     # why: pass through the same metric streams [4](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-structure)
-                        destinations = @("soc2LogAnalyticsDest")                           # why: route streams to the defined log analytics destination [4](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-structure)
-                    }
-                )
-            }
-        }                                                                                # why: end DCR definition hashtable
-
-        $metricsDcrJson = ($metricsDcrDef | ConvertTo-Json -Depth 50)                     # why: convert to JSON string for New-AzDataCollectionRule [9](https://learn.microsoft.com/en-us/powershell/module/az.monitor/new-azdatacollectionrule?view=azps-15.4.0)
-        $metricsDcr = New-AzDataCollectionRule -Name $metricsDcrName -ResourceGroupName $rgName -JsonString $metricsDcrJson # why: create DCR from JSON definition [9](https://learn.microsoft.com/en-us/powershell/module/az.monitor/new-azdatacollectionrule?view=azps-15.4.0)
-        $metricsDcrId = $metricsDcr.Id                                                   # why: capture created DCR id for association
-        Write-Host ("Created metrics export DCR: {0}" -f $metricsDcrName) -ForegroundColor Green # why: confirm creation
-        Write-Host "NOTE: Metrics will appear in AzureMetricsV2 table (allow up to ~15 minutes at first enable)." -ForegroundColor DarkCyan # why: set expectation per docs [3](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-create)
-    }                                                                                    # why: end create vs reuse
-} else {                                                                                 # why: user chose default No for duplicate export
-    Write-Host "Skipping SOC2 platform metrics export (default No to avoid duplicate cost)." -ForegroundColor Yellow # why: confirm intentional skip
-}                                                                                        # why: end metrics export DCR creation stage
-
-# --- Associate metrics DCR to each eligible resource in RG (best-effort)               # why: metrics DCR needs DCRA associations to targets [10](https://learn.microsoft.com/en-us/powershell/module/az.monitor/new-azdatacollectionruleassociation?view=azps-15.4.0)
-if ($metricsDcrId) {                                                                     # why: only associate if we created/reused the DCR
-    foreach ($res in $rgResources) {                                                     # why: associate each resource so metrics flow to SOC2 workspace (as supported)
-        $assocName = "dcra-metrics-soc2-$rgToken-$dateToken"                              # why: consistent association name per resource (unique per target resource)
-        try {                                                                            # why: association can fail for unsupported resource types/limits [3](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-create)
-            New-AzDataCollectionRuleAssociation -AssociationName $assocName -ResourceUri $res.ResourceId -DataCollectionRuleId $metricsDcrId | Out-Null # why: attach metrics export rule to resource [10](https://learn.microsoft.com/en-us/powershell/module/az.monitor/new-azdatacollectionruleassociation?view=azps-15.4.0)
-            Write-Host ("  [OK] Metrics DCR associated: {0}" -f $res.Name) -ForegroundColor Green # why: success signal
-        } catch {                                                                        # why: continue even if some resources can’t support it
-            Write-Host ("  [SKIP/FAIL] Metrics assoc for {0}: {1}" -f $res.Name, $_.Exception.Message) -ForegroundColor DarkYellow # why: show reason without halting
-        }                                                                                # why: end try/catch
-    }                                                                                    # why: end association loop
-}                                                                                        # why: end “associate metrics DCR” guard
-
-# -------------------------------                                                        # why: visual separator for guest DCRs
-# STEP 6: Create guest-log DCRs (Windows + Linux) per RG and associate to VMs            # why: you chose 2 DCRs with standard names and SOC2 baseline logs
-
-$winGuestDcrName = "dcr-guest-windows-soc2-$rgToken-$dateToken"                           # why: enforce Windows guest DCR naming convention
-$linGuestDcrName = "dcr-guest-linux-soc2-$rgToken-$dateToken"                             # why: enforce Linux guest DCR naming convention
-
-$winGuestDcrId = $null                                                                   # why: store Windows guest DCR id
-$linGuestDcrId = $null                                                                   # why: store Linux guest DCR id
-
-$vms = Get-AzVM -ResourceGroupName $rgName -Status -ErrorAction SilentlyContinue         # why: enumerate VMs in the RG for guest log onboarding
-if (-not $vms) { $vms = @() }                                                            # why: ensure array semantics even when none
-Write-Host ("VMs found in RG for guest onboarding: {0}" -f $vms.Count) -ForegroundColor Cyan # why: show scope of guest onboarding
-
-# --- Build Windows Events DCR (Application + System + Security)                        # why: SOC2 baseline includes Security + System + Application per your decision [5](https://learn.microsoft.com/en-us/azure/azure-monitor/vm/data-collection-windows-events)[8](https://docs.azure.cn/en-us/azure-monitor/data-collection/data-collection-rule-samples)
-$existingWinDcr = Get-AzDataCollectionRule -ResourceGroupName $rgName -Name $winGuestDcrName -ErrorAction SilentlyContinue # why: idempotent re-runs
-if ($existingWinDcr) {                                                                   # why: reuse if already exists for same date
-    $winGuestDcrId = $existingWinDcr.Id                                                  # why: store id for associations
-    Write-Host ("Reusing Windows guest DCR: {0}" -f $winGuestDcrName) -ForegroundColor Green # why: confirm reuse
-} else {                                                                                 # why: create definition if missing
-    $winDcrDef = @{                                                                      # why: define DCR JSON using documented stream Microsoft-Event [8](https://docs.azure.cn/en-us/azure-monitor/data-collection/data-collection-rule-samples)
-        location  = $workspaceLocation                                                    # why: DCR should be created in same region as workspace destination for consistency [11](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/data-collection-rule-create-edit)
-        properties = @{                                                                  # why: DCR properties container
-            dataSources = @{                                                             # why: define agent data sources
-                windowsEventLogs = @(
-                    @{
-                        name         = "soc2WinEventLogs"                                 # why: friendly name for this data source
-                        streams      = @("Microsoft-Event")                               # why: Windows Event logs incoming stream is Microsoft-Event [8](https://docs.azure.cn/en-us/azure-monitor/data-collection/data-collection-rule-samples)
-                        xPathQueries = @(
-                            "Application!*[System[(Level=0 or Level=1 or Level=2 or Level=3 or Level=4 or Level=5)]]", # why: collect all severities from Application for SOC2 evidence
-                            "System!*[System[(Level=0 or Level=1 or Level=2 or Level=3 or Level=4 or Level=5)]]",      # why: collect all severities from System for SOC2 evidence
-                            "Security!*[System[(Level=0 or Level=1 or Level=2 or Level=3 or Level=4 or Level=5)]]"     # why: include Security log (SOC2 auth/access evidence) [5](https://learn.microsoft.com/en-us/azure/azure-monitor/vm/data-collection-windows-events)
-                        )
-                    }
-                )
-            }
-            destinations = @{                                                            # why: define destination workspace
-                logAnalytics = @(
-                    @{
-                        workspaceResourceId = $workspaceId                                 # why: send guest event logs to SOC2 workspace [5](https://learn.microsoft.com/en-us/azure/azure-monitor/vm/data-collection-windows-events)
-                        name               = "soc2Workspace"                               # why: destination name referenced by dataFlows [8](https://docs.azure.cn/en-us/azure-monitor/data-collection/data-collection-rule-samples)
-                    }
-                )
-            }
-            dataFlows = @(
-                @{
-                    streams      = @("Microsoft-Event")                                   # why: flow the Windows event stream through to destination [8](https://docs.azure.cn/en-us/azure-monitor/data-collection/data-collection-rule-samples)
-                    destinations = @("soc2Workspace")                                      # why: route to SOC2 workspace destination [8](https://docs.azure.cn/en-us/azure-monitor/data-collection/data-collection-rule-samples)
-                    transformKql = "source"                                               # why: no transformation; keep raw events for audit evidence [8](https://docs.azure.cn/en-us/azure-monitor/data-collection/data-collection-rule-samples)
-                    outputStream = "Microsoft-Event"                                      # why: output stream remains Microsoft-Event [8](https://docs.azure.cn/en-us/azure-monitor/data-collection/data-collection-rule-samples)
-                }
-            )
-        }
-    }                                                                                    # why: end Windows DCR definition
-
-    $winDcrJson = ($winDcrDef | ConvertTo-Json -Depth 50)                                 # why: convert to JSON string for DCR create [9](https://learn.microsoft.com/en-us/powershell/module/az.monitor/new-azdatacollectionrule?view=azps-15.4.0)
-    $winDcr = New-AzDataCollectionRule -Name $winGuestDcrName -ResourceGroupName $rgName -JsonString $winDcrJson # why: create Windows guest DCR [9](https://learn.microsoft.com/en-us/powershell/module/az.monitor/new-azdatacollectionrule?view=azps-15.4.0)
-    $winGuestDcrId = $winDcr.Id                                                          # why: store DCR id for associations
-    Write-Host ("Created Windows guest DCR: {0} (events go to Event table)" -f $winGuestDcrName) -ForegroundColor Green # why: inform user where to verify [5](https://learn.microsoft.com/en-us/azure/azure-monitor/vm/data-collection-windows-events)[6](https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/event)
-}                                                                                        # why: end Windows DCR create/reuse
-
-# --- Build Linux Syslog DCR (auth/authpriv/daemon/cron/kern/syslog)                    # why: SOC2 baseline facilities and Syslog stream Microsoft-Syslog [8](https://docs.azure.cn/en-us/azure-monitor/data-collection/data-collection-rule-samples)[7](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/data-collection-rule-overview)
-$existingLinDcr = Get-AzDataCollectionRule -ResourceGroupName $rgName -Name $linGuestDcrName -ErrorAction SilentlyContinue # why: idempotent re-runs
-if ($existingLinDcr) {                                                                   # why: reuse if already exists
-    $linGuestDcrId = $existingLinDcr.Id                                                  # why: store id for associations
-    Write-Host ("Reusing Linux guest DCR: {0}" -f $linGuestDcrName) -ForegroundColor Green # why: confirm reuse
-} else {                                                                                 # why: create definition if missing
-    $linDcrDef = @{                                                                      # why: define DCR JSON using documented stream Microsoft-Syslog [8](https://docs.azure.cn/en-us/azure-monitor/data-collection/data-collection-rule-samples)
-        location  = $workspaceLocation                                                    # why: keep DCR regional alignment
-        properties = @{                                                                  # why: DCR properties container
-            dataSources = @{                                                             # why: syslog data sources specified by facility/log levels [8](https://docs.azure.cn/en-us/azure-monitor/data-collection/data-collection-rule-samples)[7](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/data-collection-rule-overview)
-                syslog = @(
-                    @{
-                        name          = "soc2SyslogAuth"                                  # why: facility group for auth/authpriv
-                        streams       = @("Microsoft-Syslog")                             # why: Syslog incoming stream is Microsoft-Syslog [8](https://docs.azure.cn/en-us/azure-monitor/data-collection/data-collection-rule-samples)
-                        facilityNames = @("auth","authpriv")                              # why: authentication evidence for SOC2
-                        logLevels     = @("Debug","Info","Notice","Warning","Error","Critical","Alert","Emergency") # why: collect all severities for auth
-                    },
-                    @{
-                        name          = "soc2SyslogSystem"                                # why: facility group for system daemons and scheduling and kernel
-                        streams       = @("Microsoft-Syslog")                             # why: Syslog stream constant [8](https://docs.azure.cn/en-us/azure-monitor/data-collection/data-collection-rule-samples)
-                        facilityNames = @("daemon","cron","kern","syslog")                # why: baseline operational + security signals
-                        logLevels     = @("Info","Notice","Warning","Error","Critical","Alert","Emergency") # why: omit Debug for non-auth to reduce noise/cost
-                    }
-                )
-            }
-            destinations = @{                                                            # why: define destination workspace
-                logAnalytics = @(
-                    @{
-                        workspaceResourceId = $workspaceId                                 # why: send syslog to SOC2 workspace [7](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/data-collection-rule-overview)
-                        name               = "soc2Workspace"                               # why: destination name referenced by dataFlows [8](https://docs.azure.cn/en-us/azure-monitor/data-collection/data-collection-rule-samples)
-                    }
-                )
-            }
-            dataFlows = @(
-                @{
-                    streams      = @("Microsoft-Syslog")                                  # why: route Syslog stream to workspace [8](https://docs.azure.cn/en-us/azure-monitor/data-collection/data-collection-rule-samples)[7](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/data-collection-rule-overview)
-                    destinations = @("soc2Workspace")                                      # why: send to SOC2 workspace
-                    transformKql = "source"                                               # why: no transformation for audit integrity [8](https://docs.azure.cn/en-us/azure-monitor/data-collection/data-collection-rule-samples)
-                    outputStream = "Microsoft-Syslog"                                     # why: keep output stream consistent [8](https://docs.azure.cn/en-us/azure-monitor/data-collection/data-collection-rule-samples)
-                }
-            )
-        }
-    }                                                                                    # why: end Linux DCR definition
-
-    $linDcrJson = ($linDcrDef | ConvertTo-Json -Depth 50)                                 # why: convert to JSON for DCR create [9](https://learn.microsoft.com/en-us/powershell/module/az.monitor/new-azdatacollectionrule?view=azps-15.4.0)
-    $linDcr = New-AzDataCollectionRule -Name $linGuestDcrName -ResourceGroupName $rgName -JsonString $linDcrJson # why: create Linux guest DCR [9](https://learn.microsoft.com/en-us/powershell/module/az.monitor/new-azdatacollectionrule?view=azps-15.4.0)
-    $linGuestDcrId = $linDcr.Id                                                          # why: store DCR id for associations
-    Write-Host ("Created Linux guest DCR: {0} (syslog goes to Syslog table)" -f $linGuestDcrName) -ForegroundColor Green # why: inform user where to verify [7](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/data-collection-rule-overview)
-}                                                                                        # why: end Linux DCR create/reuse
-
-# --- Associate DCRs to VMs and install AMA extension if missing (best-effort)          # why: guest logs require AMA + DCR association [10](https://learn.microsoft.com/en-us/powershell/module/az.monitor/new-azdatacollectionruleassociation?view=azps-15.4.0)[5](https://learn.microsoft.com/en-us/azure/azure-monitor/vm/data-collection-windows-events)[7](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/data-collection-rule-overview)
-foreach ($vm in $vms) {                                                                  # why: iterate each VM in the selected RG
-    $osType = $vm.StorageProfile.OsDisk.OsType.ToString()                                 # why: determine Windows vs Linux for DCR selection
-    $vmLocation = $vm.Location                                                           # why: VM extension requires location argument
-    $vmName = $vm.Name                                                                   # why: for readable console output
-    Write-Host ("Onboarding VM guest logs: {0} (OS: {1})" -f $vmName, $osType) -ForegroundColor Yellow # why: show progress per VM
-
-    try {                                                                                # why: check if AMA extension exists already
-        $existingExt = Get-AzVMExtension -ResourceGroupName $rgName -VMName $vmName -Name "AzureMonitorWindowsAgent" -ErrorAction SilentlyContinue # why: check Windows AMA extension name
-        $existingExt2 = Get-AzVMExtension -ResourceGroupName $rgName -VMName $vmName -Name "AzureMonitorLinuxAgent" -ErrorAction SilentlyContinue  # why: check Linux AMA extension name
-    } catch {                                                                            # why: treat errors as “not installed”
-        $existingExt = $null                                                             # why: default to null
-        $existingExt2 = $null                                                            # why: default to null
-    }                                                                                    # why: end extension checks
-
-    if ($osType -match "Windows") {                                                      # why: Windows path uses Windows AMA extension and Windows DCR
-        if (-not $existingExt) {                                                         # why: install AMA if missing
-            Write-Host "  Installing Azure Monitor Agent (Windows) extension..." -ForegroundColor Cyan # why: transparency to user
-            Set-AzVMExtension -ResourceGroupName $rgName -VMName $vmName -Name "AzureMonitorWindowsAgent" -Publisher "Microsoft.Azure.Monitor" -ExtensionType "AzureMonitorWindowsAgent" -Location $vmLocation -EnableAutomaticUpgrade $true | Out-Null # why: deploy AMA extension for Windows guest log collection
-        }                                                                                # why: end install check
-
-        $assocName = "dcra-guest-windows-soc2-$rgToken-$dateToken"                        # why: consistent per-resource association name
-        try {                                                                            # why: association may already exist or fail due to policy/RBAC
-            New-AzDataCollectionRuleAssociation -AssociationName $assocName -ResourceUri $vm.Id -DataCollectionRuleId $winGuestDcrId | Out-Null # why: attach Windows guest DCR to VM [10](https://learn.microsoft.com/en-us/powershell/module/az.monitor/new-azdatacollectionruleassociation?view=azps-15.4.0)
-            Write-Host "  [OK] Windows guest DCR associated." -ForegroundColor Green      # why: success indicator
-        } catch {                                                                        # why: keep moving even if one VM fails
-            Write-Host ("  [FAILED] Windows DCR association: {0}" -f $_.Exception.Message) -ForegroundColor Red # why: show cause
-        }                                                                                # why: end assoc try/catch
-
-    } elseif ($osType -match "Linux") {                                                  # why: Linux path uses Linux AMA extension and Linux DCR
-        if (-not $existingExt2) {                                                        # why: install AMA if missing
-            Write-Host "  Installing Azure Monitor Agent (Linux) extension..." -ForegroundColor Cyan # why: transparency
-            Set-AzVMExtension -ResourceGroupName $rgName -VMName $vmName -Name "AzureMonitorLinuxAgent" -Publisher "Microsoft.Azure.Monitor" -ExtensionType "AzureMonitorLinuxAgent" -Location $vmLocation -EnableAutomaticUpgrade $true | Out-Null # why: deploy AMA extension for Linux guest log collection
-        }                                                                                # why: end install check
-
-        $assocName = "dcra-guest-linux-soc2-$rgToken-$dateToken"                          # why: consistent association name
-        try {                                                                            # why: association may already exist or fail
-            New-AzDataCollectionRuleAssociation -AssociationName $assocName -ResourceUri $vm.Id -DataCollectionRuleId $linGuestDcrId | Out-Null # why: attach Linux guest DCR to VM [10](https://learn.microsoft.com/en-us/powershell/module/az.monitor/new-azdatacollectionruleassociation?view=azps-15.4.0)
-            Write-Host "  [OK] Linux guest DCR associated." -ForegroundColor Green        # why: success indicator
-        } catch {                                                                        # why: keep moving if fails
-            Write-Host ("  [FAILED] Linux DCR association: {0}" -f $_.Exception.Message) -ForegroundColor Red # why: show cause
-        }                                                                                # why: end assoc try/catch
-    } else {                                                                             # why: unknown OS types should not be modified blindly
-        Write-Host ("  [SKIP] Unknown OS type for VM: {0}" -f $osType) -ForegroundColor Yellow # why: explain skip
-    }                                                                                    # why: end OS branching
-}                                                                                        # why: end VM loop
-
-# -------------------------------                                                        # why: visual separator for post-scan/report
-# STEP 7: Re-scan final state and export CSV                                             # why: confirm outcome and produce an easy artifact
-
-$finalRows = @()                                                                         # why: gather final reporting rows
-foreach ($r in $scanResults) {                                                           # why: iterate scanned resources to refresh status
-    $soc2DiagExists = $false                                                             # why: will be true if SOC2 diag setting name exists on resource
-    $soc2EnabledLogCats = @()                                                            # why: store enabled log categories we configured
-    $soc2EnabledMetricCats = @()                                                         # why: store enabled metric categories we configured
-    $soc2DisabledLogCats = @()                                                           # why: store disabled log categories (should be none if created by us)
-    $soc2DisabledMetricCats = @()                                                        # why: store disabled metric categories (should be none if created by us)
-
-    if ($r.AzureMonitorSupported -eq $true) {                                            # why: only try fetch if supported
-        try {                                                                            # why: fetch diag settings and find ours by standard name
-            $dsAll = Get-AzDiagnosticSetting -ResourceId $r.ResourceId                    # why: retrieve diagnostic settings during final verification
-            $our = $dsAll | Where-Object { $_.Name -eq $diagSettingName } | Select-Object -First 1 # why: pick our SOC2 diag setting by name
-            if ($our) {                                                                  # why: only parse categories if our setting exists
-                $soc2DiagExists = $true                                                  # why: mark presence
-                foreach ($l in $our.Logs) {                                              # why: parse log category enabled flags
-                    if ($l.Enabled) { $soc2EnabledLogCats += $l.Category } else { $soc2DisabledLogCats += $l.Category } # why: classify enabled vs disabled
-                }                                                                        # why: end log parse
-                foreach ($m in $our.Metrics) {                                           # why: parse metric category enabled flags
-                    if ($m.Enabled) { $soc2EnabledMetricCats += $m.Category } else { $soc2DisabledMetricCats += $m.Category } # why: classify enabled vs disabled
-                }                                                                        # why: end metric parse
-            }                                                                            # why: end our-setting exists
-        } catch {                                                                        # why: tolerate read failures
-            $soc2DiagExists = $false                                                     # why: treat as not verified
-        }                                                                                # why: end try/catch
-    }                                                                                    # why: end supported guard
-
-    $finalRows += [PSCustomObject]@{                                                     # why: create final CSV record
-        ResourceName                = $r.ResourceName                                    # why: identify resource
-        ResourceType                = $r.ResourceType                                    # why: identify type
-        ResourceId                  = $r.ResourceId                                      # why: traceable key
-        AzureMonitorSupported       = $r.AzureMonitorSupported                           # why: whether resource supports diag settings
-        ExistingDiagSettingNames    = $r.ExistingDiagSettingNames                         # why: what existed before we ran
-        ExistingDestinations        = $r.ExistingDestinations                             # why: where it was routing before
-        Soc2DiagSettingName         = $diagSettingName                                    # why: our standard SOC2 diag setting name
-        Soc2DiagSettingPresent      = $soc2DiagExists                                     # why: whether our SOC2 diag setting exists now
-        Soc2EnabledLogCategories    = ($soc2EnabledLogCats | Sort-Object -Unique) -join ";" # why: categories we enabled (logs)
-        Soc2DisabledLogCategories   = ($soc2DisabledLogCats | Sort-Object -Unique) -join ";" # why: categories disabled (logs)
-        Soc2EnabledMetricCategories = ($soc2EnabledMetricCats | Sort-Object -Unique) -join ";" # why: categories we enabled (metrics)
-        Soc2DisabledMetricCategories= ($soc2DisabledMetricCats | Sort-Object -Unique) -join ";" # why: categories disabled (metrics)
-        MetricsDcrName              = $metricsDcrName                                     # why: per-RG metrics DCR name (if created)
-        WindowsGuestDcrName         = $winGuestDcrName                                    # why: per-RG Windows guest DCR name
-        LinuxGuestDcrName           = $linGuestDcrName                                    # why: per-RG Linux guest DCR name
-        Soc2WorkspaceName           = $workspace.Name                                     # why: final SOC2 workspace chosen/created
-        Soc2WorkspaceId             = $workspaceId                                        # why: resource id for cross-checking
-    }                                                                                    # why: end row creation
-}                                                                                        # why: end final scan loop
-
-$csvFileName = ("soc2-onboarding-{0}-{1}.csv" -f $rgToken, (Get-Date -Format "yyyyMMdd-HHmmss")) # why: unique filename to avoid overwrite
-$csvPath = Join-Path -Path $PWD.Path -ChildPath $csvFileName                             # why: dynamic “current working directory” CSV path per your requirement
-$finalRows | Export-Csv -Path $csvPath -NoTypeInformation                                # why: persist results for evidence and troubleshooting
-
-Write-Host "=================================================================================" -ForegroundColor Cyan # why: summary section divider
-Write-Host "SOC2 Onboarding Summary" -ForegroundColor Cyan                                # why: clear summary title
-Write-Host "=================================================================================" -ForegroundColor Cyan # why: divider
-Write-Host ("RG: {0}" -f $rgName)                                                        # why: show scope
-Write-Host ("SOC2 Workspace: {0}" -f $workspace.Name)                                    # why: show workspace used
-Write-Host ("CSV saved to: {0}" -f $csvPath)                                             # why: tell user where output is
-Write-Host "Verification tips (Log Analytics -> Logs):" -ForegroundColor Cyan            # why: guide user to validate ingestion
-Write-Host "  - Platform metrics: query AzureMetricsV2 (allow up to ~15 minutes initially)" -ForegroundColor Gray # why: metrics export lands here [3](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-create)
-Write-Host "  - Windows guest logs: query Event table" -ForegroundColor Gray             # why: Windows events stored in Event table [5](https://learn.microsoft.com/en-us/azure/azure-monitor/vm/data-collection-windows-events)[6](https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/event)
-Write-Host "  - Linux guest logs: query Syslog table" -ForegroundColor Gray              # why: Syslog stored in Syslog table [7](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/data-collection-rule-overview)
-Write-Host "=================================================================================" -ForegroundColor Cyan # why: divider
-
-# Optional: Cloud Shell convenience download                                               # why: only works in Azure Cloud Shell
-if (Get-Command download -ErrorAction SilentlyContinue) { download $csvPath }            # why: trigger browser download if running in Cloud Shell
-``
+# ============================================================
+# FULL SCRIPT: Create Workspace → Scan → Enable Diagnostics → Export CSV
+# ============================================================
+# ============================================================
+# KEEP-ALIVE: Prevents Cloud Shell timeout during long scans
+# ============================================================
+$keepAliveJob = Start-Job -ScriptBlock {
+while ($true) {
+Start-Sleep -Seconds 240
+Write-Output " [keep-alive] Still running..."
+}
+}
+
+# ============================================================
+# STEP 1: Check for Existing Log Analytics Workspaces
+# ============================================================
+
+Write-Host "Checking for existing Log Analytics workspaces..." -ForegroundColor Cyan
+$existingWorkspaces = Get-AzOperationalInsightsWorkspace -ErrorAction SilentlyContinue
+$skipWorkspaceCreation = $false
+if ($existingWorkspaces -and $existingWorkspaces.Count -gt 0) {
+Write-Host " Found $($existingWorkspaces.Count) existing workspace(s):" -ForegroundColor Yellow
+$i = 1
+foreach ($ws in $existingWorkspaces) {
+Write-Host " [$i] $($ws.Name) | RG: $($ws.ResourceGroupName) | Location: $($ws.Location)" -ForegroundColor Gray
+$i++
+}
+Write-Host "Would you like to:" -ForegroundColor Cyan
+Write-Host " [1] Connect resources to an existing workspace" -ForegroundColor White
+Write-Host " [2] Create a new workspace" -ForegroundColor White
+$wsChoice = Read-Host "Enter 1 or 2"
+if ($wsChoice -eq "1") {
+$wsIndex = Read-Host "Enter the number of the workspace you want to use"
+if ($wsIndex -match '^\d+$' -and
+[int]$wsIndex -ge 1 -and
+[int]$wsIndex -le $existingWorkspaces.Count) {
+$selectedWs = $existingWorkspaces[[int]$wsIndex - 1]
+$workspaceId = $selectedWs.ResourceId
+$workspaceName = $selectedWs.Name
+$workspaceRG = $selectedWs.ResourceGroupName
+$skipWorkspaceCreation = $true
+Write-Host " [OK] Using existing workspace: $workspaceName" -ForegroundColor Green
+Write-Host " Workspace ID: $workspaceId" -ForegroundColor DarkCyan
+} else {
+Write-Warning "Invalid selection. Please re-run the script."
+Stop-Job $keepAliveJob | Out-Null
+exit
+}
+} elseif ($wsChoice -eq "2") {
+Write-Host " Proceeding to create a new workspace..." -ForegroundColor Green
+$skipWorkspaceCreation = $false
+} else {
+Write-Warning "Invalid choice. Please re-run the script and enter 1 or 2."
+Stop-Job $keepAliveJob | Out-Null
+exit
+}
+} else { Write-Host " No existing workspaces found. A new one will be created." -ForegroundColor Gray
+$skipWorkspaceCreation = $false
+}
+# ============================================================
+# STEP 2: Interactive Workspace Setup (only if needed)
+# ============================================================
+if (-not $skipWorkspaceCreation) {
+# --- Workspace Name ---
+$defaultName = "log-diagnostics-$(Get-Date -Format 'yyyyMMddHHmmss')"
+Write-Host "Default workspace name: $defaultName" -ForegroundColor Cyan
+$customName = Read-Host "Would you like to use a custom name instead? (yes/no)"
+if ($customName -eq "yes") {
+$workspaceName = Read-Host "Enter your desired workspace name"
+} else {
+$workspaceName = $defaultName
+}
+Write-Host "Workspace name set to: $workspaceName" -ForegroundColor Green
+# --- Resource Group ---
+Write-Host "Which resource group should the Log Analytics workspace be created in?" -ForegroundColor Cyan
+$rgChoice = Read-Host "Type 'same' to use an existing resource group, or 'different' for a new/separate one"
+if ($rgChoice -eq "same") {
+$resourceGroups = Get-AzResourceGroup
+Write-Host "Available Resource Groups:" -ForegroundColor Cyan
+$i = 1
+foreach ($rg in $resourceGroups) {
+Write-Host " [$i] $($rg.ResourceGroupName)" -ForegroundColor Gray
+$i++
+}
+$rgIndex = Read-Host "Enter the number of the resource group you want to use"
+if ($rgIndex -match '^\d+$' -and
+[int]$rgIndex -ge 1 -and
+[int]$rgIndex -le $resourceGroups.Count) {
+$workspaceRG = $resourceGroups[[int]$rgIndex - 1].ResourceGroupName
+Write-Host " Selected: $workspaceRG" -ForegroundColor Green
+} else {
+Write-Warning "Invalid selection. Please re-run the script and enter a valid number."
+Stop-Job $keepAliveJob | Out-Null
+exit
+}
+} elseif ($rgChoice -eq "different") {
+Write-Host "Would you like to name the new resource group 'rg-monitoring' or something else?" -ForegroundColor Cyan
+$rgNameChoice = Read-Host "Type 'rg-monitoring' to use that, or 'custom' to enter your own"
+if ($rgNameChoice -eq "rg-monitoring") {
+$workspaceRG = "rg-monitoring"
+} else {
+$workspaceRG = Read-Host "Enter your desired resource group name"
+}
+$location = Read-Host "Enter the Azure region for the new resource group (e.g. eastus, westus2)"
+Write-Host "Creating resource group '$workspaceRG' in '$location'..." -ForegroundColor Cyan
+try {
+New-AzResourceGroup -Name $workspaceRG -Location $location -ErrorAction Stop | Out-Null
+Write-Host " [OK] Resource group '$workspaceRG' created." -ForegroundColor Green
+} catch {
+Write-Warning " [FAILED] Could not create resource group: $_"
+Stop-Job $keepAliveJob | Out-Null
+exit
+}
+} else {
+Write-Warning "Invalid choice. Please re-run the script and type 'same' or 'different'."
+Stop-Job $keepAliveJob | Out-Null
+exit
+}
+# ============================================================
+# STEP 3: Create the Log Analytics Workspace
+# ============================================================
+Write-Host "Creating Log Analytics Workspace '$workspaceName' in '$workspaceRG'..." -ForegroundColor Cyan
+try {
+$rgLocation = (Get-AzResourceGroup -Name $workspaceRG).Location
+$workspace = New-AzOperationalInsightsWorkspace `
+-ResourceGroupName $workspaceRG `
+-Name $workspaceName `
+-Location $rgLocation `
+-Sku PerGB2018 `
+-ErrorAction Stop
+$workspaceId = $workspace.ResourceId
+Write-Host " [OK] Workspace created." -ForegroundColor Green
+Write-Host " Workspace ID: $workspaceId" -ForegroundColor DarkCyan
+} catch {
+Write-Warning " [FAILED] Could not create Log Analytics Workspace: $_"
+Stop-Job $keepAliveJob | Out-Null
+exit
+}
+}
+# ============================================================
+# STEP 4: Scan all resources in the subscription
+# ============================================================
+Write-Host "Scanning all resources in subscription..." -ForegroundColor Cyan
+Write-Host "(Progress updates every 10 resources)" -ForegroundColor Gray
+$allResources = Get-AzResource
+$results = @()
+$processed = 0
+foreach ($resource in $allResources) {
+$azureMonitorSupported = $false
+$diagnosticsEnabled = $false
+$sendingToLogAnalytics = $false
+# Check if Monitor is supported
+try {
+$categories = Get-AzDiagnosticSettingCategory `
+-ResourceId $resource.ResourceId -ErrorAction Stop
+if ($categories -and $categories.Count -gt 0) {
+$azureMonitorSupported = $true
+}
+} catch {
+$azureMonitorSupported = $false
+}
+# If supported, check if diagnostics are already enabled
+if ($azureMonitorSupported) {
+try {
+$diagSettings = Get-AzDiagnosticSetting `
+-ResourceId $resource.ResourceId -ErrorAction Stop
+if ($diagSettings -and $diagSettings.Count -gt 0) {
+$diagnosticsEnabled = $true
+$sendingToLogAnalytics = ($diagSettings | Where-Object { $_.WorkspaceId -ne $null }) -ne $null
+}
+} catch {
+$diagnosticsEnabled = $false
+$sendingToLogAnalytics = $false
+}
+}
+$results += [PSCustomObject]@{
+ResourceName = $resource.Name
+ResourceType = $resource.ResourceType
+ResourceGroup = $resource.ResourceGroupName
+ResourceId = $resource.ResourceId
+AzureMonitorSupported = $azureMonitorSupported
+DiagnosticsEnabled = $diagnosticsEnabled
+SendingToLogAnalytics = $sendingToLogAnalytics
+}
+$processed++
+# Progress update every 10 resources (keeps session alive)
+if ($processed % 10 -eq 0) {
+Write-Host " Scanned $processed / $($allResources.Count) resources..." -ForegroundColor DarkGray
+}
+}
+Write-Host "Scan complete. Total resources: $($results.Count)" -ForegroundColor Cyan
+# ============================================================
+# STEP 5: Enable diagnostics on eligible resources change up $_.DiagnosticsEnabled -eq $true -and
+#to $_.DiagnosticsEnabled -eq $false -and , to avoid duplicate diagnostic settings per resource.
+# ============================================================
+$eligibleResources = $results | Where-Object {
+$_.AzureMonitorSupported -eq $true -and
+$_.DiagnosticsEnabled -eq $false -and
+$_.ResourceType -ne "Microsoft.OperationalInsights/workspaces" -and
+$_.ResourceType -notlike "*/projects"
+}
+Write-Host "Eligible for diagnostics: $($eligibleResources.Count)" -ForegroundColor Cyan
+foreach ($resource in $eligibleResources) {
+Write-Host " Processing: $($resource.ResourceName)" -ForegroundColor Yellow
+# Get diagnostic categories
+try {
+$categories = Get-AzDiagnosticSettingCategory `
+-ResourceId $resource.ResourceId -ErrorAction Stop
+} catch {
+Write-Warning " [SKIP] Could not get categories for $($resource.ResourceName): $_"
+continue
+}
+if (-not $categories -or $categories.Count -eq 0) {
+Write-Warning " [SKIP] No categories found for $($resource.ResourceName)."
+continue
+}
+# Build log settings
+$logSettings = @()
+foreach ($cat in ($categories | Where-Object { $_.CategoryType -eq "Logs" })) {
+$logSettings += New-AzDiagnosticSettingLogSettingsObject `
+-Category $cat.Name `
+-Enabled $true `
+-RetentionPolicyDay 0 `
+-RetentionPolicyEnabled $false
+}
+# Build metric settings
+$metricSettings = @()
+foreach ($cat in ($categories | Where-Object { $_.CategoryType -eq "Metrics" })) {
+$metricSettings += New-AzDiagnosticSettingMetricSettingsObject `
+-Category $cat.Name `
+-Enabled $true `
+-RetentionPolicyDay 0 `
+-RetentionPolicyEnabled $false
+}
+if ($logSettings.Count -eq 0 -and $metricSettings.Count -eq 0) {
+Write-Warning " [SKIP] No log or metric objects built for $($resource.ResourceName)."
+continue
+}
+# Apply diagnostic setting
+try {
+$diagParams = @{
+Name = "diag-to-log-$(Get-Date -Format 'yyyyMMddHHmmss')"
+ResourceId = $resource.ResourceId
+WorkspaceId = $workspaceId
+}
+if ($logSettings.Count -gt 0) { $diagParams["Log"] = $logSettings }
+if ($metricSettings.Count -gt 0) { $diagParams["Metric"] = $metricSettings }
+New-AzDiagnosticSetting @diagParams -ErrorAction Stop | Out-Null
+Write-Host " [OK] Diagnostics enabled for $($resource.ResourceName)" -ForegroundColor Green
+} catch {
+Write-Warning " [FAILED] $($resource.ResourceName): $_"
+}
+}
+# ============================================================
+# STEP 6: Re-scan and export updated status to CSV
+# ============================================================
+Write-Host "Re-scanning to verify final diagnostics status..." -ForegroundColor Cyan
+$refreshedResults = @()
+foreach ($resource in $results) {
+$diagnosticsEnabled = $false
+$sendingToLogAnalytics = $false
+$azureMonitorSupported = $resource.AzureMonitorSupported
+if ($azureMonitorSupported) {
+try {
+$diagSettings = Get-AzDiagnosticSetting `
+-ResourceId $resource.ResourceId -ErrorAction Stop
+if ($diagSettings -and $diagSettings.Count -gt 0) {
+$diagnosticsEnabled = $true
+$sendingToLogAnalytics = ($diagSettings | Where-Object { $_.WorkspaceId -ne $null }) -ne $null
+}
+} catch {
+$azureMonitorSupported = $false
+}
+}
+$refreshedResults += [PSCustomObject]@{
+ResourceName = $resource.ResourceName
+ResourceType = $resource.ResourceType
+ResourceGroup = $resource.ResourceGroup
+ResourceId = $resource.ResourceId
+AzureMonitorSupported = $azureMonitorSupported
+DiagnosticsEnabled = $diagnosticsEnabled
+SendingToLogAnalytics = $sendingToLogAnalytics
+}
+}
+$csvPath = "/home/johnathan/diagnostics-status-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+$refreshedResults | Export-Csv -Path $csvPath -NoTypeInformation
+# ============================================================
+# STEP 7: Print summary
+# ============================================================
+$total = $refreshedResults.Count
+$diagEnabled = ($refreshedResults | Where-Object { $_.DiagnosticsEnabled -eq $true }).Count
+$sendingToLOG = ($refreshedResults | Where-Object { $_.SendingToLogAnalytics -eq $true }).Count
+$notSupported = ($refreshedResults | Where-Object { $_.AzureMonitorSupported -eq $false }).Count
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " Final Diagnostics Summary" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " Total Resources : $total"
+Write-Host " Diagnostics Enabled : $diagEnabled" -ForegroundColor Green
+Write-Host " Sending to Log Analytics: $sendingToLOG" -ForegroundColor Green
+Write-Host " Monitor Not Supported : $notSupported" -ForegroundColor Yellow
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " Workspace Used : $workspaceName" -ForegroundColor White
+Write-Host " Workspace Resource ID : $workspaceId" -ForegroundColor White
+Write-Host " CSV saved to : $csvPath" -ForegroundColor White
+Write-Host "============================================================" -ForegroundColor Cyan
+Stop-Job $keepAliveJob | Out-Null
+download $csvPath
