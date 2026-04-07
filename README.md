@@ -1,6 +1,7 @@
 # Azure Monitor & Log Analytics Onboarding Script<br>
 This PowerShell script streamlines onboarding Azure resources into Azure Monitor and Log Analytics, helping you quickly centralize logs, enable diagnostics, and understand your monitoring coverage across a subscription.
-
+<br><br>
+To run the script, copy & paste the Main file into Azure Cloud Shell's Powershell. <br>
 ## What This Script Does<br>
 The script guides you through discovering (or creating) a Log Analytics Workspace (LAW), then scans your Azure subscription to connect supported resources, enable diagnostics, and export visibility into the results.
 <details>
