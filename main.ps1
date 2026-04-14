@@ -189,18 +189,30 @@ Write-Host " Scanned $processed / $($allResources.Count) resources..." -Foregrou
 }
 }
 Write-Host "Scan complete. Total resources: $($results.Count)" -ForegroundColor Cyan
+
+# After building $results, split into VM vs non-VM. Needed for AMA architecture modernization.
+$vmResources = $results | Where-Object {
+    $_.ResourceType -eq "Microsoft.Compute/virtualMachines"
+}
+
+#to $_.DiagnosticsEnabled -eq $false -and , to avoid duplicate diagnostic settings per resource.
+$nonVmResources = $results | Where-Object {
+    $_.ResourceType -ne "Microsoft.Compute/virtualMachines" -and
+    $_.AzureMonitorSupported -eq $true -and
+    $_.DiagnosticsEnabled -eq $false -and
+    $_.ResourceType -ne "Microsoft.OperationalInsights/workspaces" -and
+    $_.ResourceType -notlike "*/projects"
+}
+
+Write-Host " VMs eligible for AMA: $($vmResources.Count)" -ForegroundColor Cyan
+Write-Host " Non-VM resources eligible for Diagnostic Settings: $($nonVmResources.Count)" -ForegroundColor Cyan
+
 # ============================================================
 # STEP 5: Enable diagnostics on eligible resources change up $_.DiagnosticsEnabled -eq $true -and
-#to $_.DiagnosticsEnabled -eq $false -and , to avoid duplicate diagnostic settings per resource.
 # ============================================================
-$eligibleResources = $results | Where-Object {
-$_.AzureMonitorSupported -eq $true -and
-$_.DiagnosticsEnabled -eq $false -and
-$_.ResourceType -ne "Microsoft.OperationalInsights/workspaces" -and
-$_.ResourceType -notlike "*/projects"
-}
-Write-Host "Eligible for diagnostics: $($eligibleResources.Count)" -ForegroundColor Cyan
-foreach ($resource in $eligibleResources) {
+
+Write-Host "Eligible for diagnostics: $($nonVmResources.Count)" -ForegroundColor Cyan
+foreach ($resource in $nonVmResources) {
 Write-Host " Processing: $($resource.ResourceName)" -ForegroundColor Yellow
 # Get diagnostic categories
 try {
@@ -251,11 +263,166 @@ Write-Host " [OK] Diagnostics enabled for $($resource.ResourceName)" -Foreground
 Write-Warning " [FAILED] $($resource.ResourceName): $_"
 }
 }
+
+# ============================================================
+# STEP 5B: AMA — Install Agent + Create DCR for VMs
+# ============================================================
+
+# Get auth token once — used for DCR creation (B2) and DCRA verification (Step 6)
+$token = (Get-AzAccessToken -ResourceUrl "https://management.azure.com").Token | ConvertFrom-SecureString -AsPlainText
+$headers = @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" }
+
+
+# --- B1: Install AMA on each eligible VM ---
+foreach ($vm in $vmResources) {
+
+    # Get full VM object — needed for OS type, location, and identity check
+    $vmObj = Get-AzVM -ResourceGroupName $vm.ResourceGroup -Name $vm.ResourceName
+
+    # Ensure VM has system-assigned managed identity — required for AMA to authenticate
+    if ($vmObj.Identity.Type -notlike "*SystemAssigned*") {
+        Write-Host "  Enabling system-assigned identity on $($vm.ResourceName)..." -ForegroundColor Yellow
+        Update-AzVM -ResourceGroupName $vm.ResourceGroup -VM $vmObj -IdentityType SystemAssigned | Out-Null
+        Write-Host "  [OK] Identity enabled on $($vm.ResourceName)" -ForegroundColor Green
+    } else {
+        Write-Host "  [OK] Identity already enabled on $($vm.ResourceName)" -ForegroundColor Gray
+    }
+
+    # Determine OS type to pick the correct AMA extension name
+    $osType    = $vmObj.StorageProfile.OsDisk.OsType
+    $extName   = if ($osType -eq "Windows") { "AzureMonitorWindowsAgent" } else { "AzureMonitorLinuxAgent" }
+    $publisher = "Microsoft.Azure.Monitor"
+    $extType   = $extName
+
+    # Check if AMA extension is already installed — avoid reinstalling
+    $existingExt = Get-AzVMExtension `
+        -ResourceGroupName $vm.ResourceGroup `
+        -VMName           $vm.ResourceName `
+        -Name             $extName `
+        -ErrorAction      SilentlyContinue
+
+    if (-not $existingExt) {
+        Write-Host "  Installing $extName on $($vm.ResourceName)..." -ForegroundColor Yellow
+        Set-AzVMExtension `
+            -ResourceGroupName   $vm.ResourceGroup `
+            -VMName              $vm.ResourceName `
+            -Name                $extName `
+            -Publisher           $publisher `
+            -ExtensionType       $extType `
+            -TypeHandlerVersion  "1.0" `
+            -Location            $vmObj.Location `
+            -EnableAutomaticUpgrade $true `
+            -ErrorAction         Stop | Out-Null
+        Write-Host "  [OK] AMA installed on $($vm.ResourceName)" -ForegroundColor Green
+    } else {
+        Write-Host "  [SKIP] AMA already installed on $($vm.ResourceName)" -ForegroundColor Gray
+    }
+}
+
+
+# --- B2: Create DCR (once, shared across all VMs) ---
+# DCR targets your existing Log Analytics workspace
+if ($vmResources.Count -gt 0) {
+$dcrName = "dcr-ama-$(Get-Date -Format 'MMddyyyy')"
+$dcrLocation = (Get-AzResourceGroup -Name $workspaceRG).Location
+
+$dcrBody = @{
+    location   = $dcrLocation
+    properties = @{
+        destinations = @{
+            logAnalytics = @(
+                @{
+                    workspaceResourceId = $workspaceId
+                    name                = "lawDestination"
+                }
+            )
+        }
+        dataFlows = @(
+            @{
+                streams      = @("Microsoft-Event", "Microsoft-Syslog", "Microsoft-Perf")
+                destinations = @("lawDestination")
+            }
+        )
+        dataSources = @{
+            performanceCounters = @(
+                @{
+                    name                    = "perfCounters"
+                    streams                 = @("Microsoft-Perf")
+                    samplingFrequencyInSeconds = 60
+                    counterSpecifiers       = @(
+                        "\\Processor(_Total)\\% Processor Time",
+                        "\\Memory\\Available MBytes",
+                        "\\LogicalDisk(_Total)\\Disk Read Bytes/sec",
+                        "\\LogicalDisk(_Total)\\Disk Write Bytes/sec"
+                    )
+                }
+            )
+            windowsEventLogs = @(
+                @{
+                    name    = "windowsEventLogs"
+                    streams = @("Microsoft-Event")
+                    xPathQueries = @("System!*[System[(Level=1 or Level=2 or Level=3)]]", "Application!*[System[(Level=1 or Level=2)]]")
+                }
+            )
+            syslog = @(
+                @{
+                    name       = "syslogDataSource"
+                    streams    = @("Microsoft-Syslog")
+                    facilityNames = @("auth", "cron", "daemon", "kern", "syslog")
+                    logLevels  = @("Error", "Critical", "Alert", "Emergency")
+                }
+            )
+        }
+    }
+} | ConvertTo-Json -Depth 10
+
+# Deploy DCR via REST
+$subscriptionId = (Get-AzContext).Subscription.Id
+$dcrRgEncoded   = [uri]::EscapeDataString($workspaceRG)
+$dcrUri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$workspaceRG/providers/Microsoft.Insights/dataCollectionRules/$($dcrName)?api-version=2022-06-01"
+
+$token = (Get-AzAccessToken -ResourceUrl "https://management.azure.com").Token | ConvertFrom-SecureString -AsPlainText
+$headers = @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" }
+
+$dcrResponse = Invoke-RestMethod -Method Put -Uri $dcrUri -Headers $headers -Body $dcrBody
+$dcrId = $dcrResponse.id
+Write-Host " [OK] DCR created: $dcrName" -ForegroundColor Green
+Write-Host "  DCR ID: $dcrId" -ForegroundColor DarkCyan
+
+
+
+# ============================================================
+# STEP 5C: Associate DCR to each VM (DCRA)
+# ============================================================
+
+foreach ($vm in $vmResources) {
+    $dcraName = "dcra-$($vm.ResourceName)-$(Get-Date -Format 'MMddyyyy')"
+    $dcraUri  = "https://management.azure.com$($vm.ResourceId)/providers/Microsoft.Insights/dataCollectionRuleAssociations/$($dcraName)?api-version=2022-06-01"
+
+    $dcraBody = @{
+        properties = @{
+            dataCollectionRuleId = $dcrId
+        }
+    } | ConvertTo-Json -Depth 5
+
+    try {
+        Invoke-RestMethod -Method Put -Uri $dcraUri -Headers $headers -Body $dcraBody | Out-Null
+        Write-Host "  [OK] DCR associated to $($vm.ResourceName)" -ForegroundColor Green
+    } catch {
+        Write-Warning "  [FAILED] Could not associate DCR to $($vm.ResourceName): $_"
+    }
+}
+} else {
+    Write-Host " [SKIP] No eligible VMs found. Skipping DCR creation." -ForegroundColor Gray
+}
 # ============================================================
 # STEP 6: Re-scan and export updated status to CSV
 # ============================================================
+
 Write-Host "Re-scanning to verify final diagnostics status..." -ForegroundColor Cyan
 $refreshedResults = @()
+$token = (Get-AzAccessToken -ResourceUrl "https://management.azure.com").Token | ConvertFrom-SecureString -AsPlainText
+$headers = @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" }
 foreach ($resource in $results) {
 $diagnosticsEnabled = $false
 $sendingToLogAnalytics = $false
@@ -272,14 +439,37 @@ $sendingToLogAnalytics = ($diagSettings | Where-Object { $_.WorkspaceId -ne $nul
 $azureMonitorSupported = $false
 }
 }
+
+# Check AMA association for VMs
+$amaInstalled = $false
+$dcrAssociated = $false
+
+if ($resource.ResourceType -eq "Microsoft.Compute/virtualMachines") {
+    $winExt = Get-AzVMExtension -ResourceGroupName $resource.ResourceGroup `
+                                 -VMName $resource.ResourceName `
+                                 -Name "AzureMonitorWindowsAgent" -ErrorAction SilentlyContinue
+    $linExt = Get-AzVMExtension -ResourceGroupName $resource.ResourceGroup `
+                                 -VMName $resource.ResourceName `
+                                 -Name "AzureMonitorLinuxAgent" -ErrorAction SilentlyContinue
+    $amaInstalled = ($winExt -or $linExt) -ne $null
+
+    # Check if a DCRA exists for this VM
+    $dcraCheck = Invoke-RestMethod -Method Get `
+        -Uri "https://management.azure.com$($resource.ResourceId)/providers/Microsoft.Insights/dataCollectionRuleAssociations?api-version=2022-06-01" `
+        -Headers $headers -ErrorAction SilentlyContinue
+    $dcrAssociated = ($dcraCheck.value.Count -gt 0)
+}
+
 $refreshedResults += [PSCustomObject]@{
-ResourceName = $resource.ResourceName
-ResourceType = $resource.ResourceType
-ResourceGroup = $resource.ResourceGroup
-ResourceId = $resource.ResourceId
-AzureMonitorSupported = $azureMonitorSupported
-DiagnosticsEnabled = $diagnosticsEnabled
-SendingToLogAnalytics = $sendingToLogAnalytics
+    ResourceName          = $resource.ResourceName
+    ResourceType          = $resource.ResourceType
+    ResourceGroup         = $resource.ResourceGroup
+    ResourceId            = $resource.ResourceId
+    AzureMonitorSupported = $azureMonitorSupported
+    DiagnosticsEnabled    = $diagnosticsEnabled
+    SendingToLogAnalytics = $sendingToLogAnalytics
+    AMAInstalled          = $amaInstalled      # NEW
+    DCRAssociated         = $dcrAssociated     # NEW
 }
 }
 $csvPath = Join-Path $PWD.Path "diagnostics-status-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
@@ -287,21 +477,25 @@ $refreshedResults | Export-Csv -Path $csvPath -NoTypeInformation
 # ============================================================
 # STEP 7: Print summary
 # ============================================================
-$total = $refreshedResults.Count
-$diagEnabled = ($refreshedResults | Where-Object { $_.DiagnosticsEnabled -eq $true }).Count
-$sendingToLOG = ($refreshedResults | Where-Object { $_.SendingToLogAnalytics -eq $true }).Count
-$notSupported = ($refreshedResults | Where-Object { $_.AzureMonitorSupported -eq $false }).Count
+$total         = $refreshedResults.Count
+$diagEnabled   = ($refreshedResults | Where-Object { $_.DiagnosticsEnabled    -eq $true }).Count
+$sendingToLOG  = ($refreshedResults | Where-Object { $_.SendingToLogAnalytics -eq $true }).Count
+$notSupported  = ($refreshedResults | Where-Object { $_.AzureMonitorSupported -eq $false }).Count
+$amaCount      = ($refreshedResults | Where-Object { $_.AMAInstalled          -eq $true }).Count
+$dcrCount      = ($refreshedResults | Where-Object { $_.DCRAssociated         -eq $true }).Count
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host " Final Diagnostics Summary" -ForegroundColor Cyan
+Write-Host " Final Diagnostics Summary"                                    -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host " Total Resources : $total"
-Write-Host " Diagnostics Enabled : $diagEnabled" -ForegroundColor Green
-Write-Host " Sending to Log Analytics: $sendingToLOG" -ForegroundColor Green
-Write-Host " Monitor Not Supported : $notSupported" -ForegroundColor Yellow
+Write-Host " Total Resources          : $total"
+Write-Host " Diagnostics Enabled      : $diagEnabled"                     -ForegroundColor Green
+Write-Host " Sending to Log Analytics : $sendingToLOG"                    -ForegroundColor Green
+Write-Host " AMA Installed (VMs)      : $amaCount"                        -ForegroundColor Green
+Write-Host " DCR Associated (VMs)     : $dcrCount"                        -ForegroundColor Green
+Write-Host " Monitor Not Supported    : $notSupported"                    -ForegroundColor Yellow
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host " Workspace Used : $workspaceName" -ForegroundColor White
-Write-Host " Workspace Resource ID : $workspaceId" -ForegroundColor White
-Write-Host " CSV saved to : $csvPath" -ForegroundColor White
+Write-Host " Workspace Used           : $workspaceName"                   -ForegroundColor White
+Write-Host " Workspace Resource ID    : $workspaceId"                     -ForegroundColor White
+Write-Host " CSV saved to             : $csvPath"                         -ForegroundColor White
 Write-Host "============================================================" -ForegroundColor Cyan
 Stop-Job $keepAliveJob | Out-Null
 download $csvPath
